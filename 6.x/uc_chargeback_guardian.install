@@ -1,0 +1,36 @@
+<?php
+// $Id: $
+
+/**
+ * @file
+ * Handles installing and uninstalling Chargeback Guardian module.
+ *
+ * Derived from uc_paytrace code by David Long <dave@longwaveconsulting.com>
+ * http://drupal.org/project/uc_paytrace
+ *
+ */
+
+/**
+ * Implementation of hook_requirements().
+ */
+function uc_chargeback_guardian_requirements($phase) {
+  $t = get_t();
+
+  $has_curl = function_exists('curl_init');
+
+  $requirements['uc_chargeback_guardian_curl'] = array(
+    'title' => $t('cURL'),
+    'value' => $has_curl ? $t('Enabled') : $t('Not found'),
+  );
+  if (!$has_curl) {
+    $requirements['uc_chargeback_guardian_curl']['severity'] = REQUIREMENT_ERROR;
+    $requirements['uc_chargeback_guardian_curl']['description'] = $t("Chargeback Guardian requires the PHP <a href='!curl_url'>cURL</a> library.", array('!curl_url' => 'http://php.net/manual/en/curl.setup.php'));
+  }
+
+  return $requirements;
+}
+
+function uc_chargeback_guardian_uninstall() {
+  db_query("DELETE FROM {variable} WHERE name LIKE 'uc_chargeback_guardian_%%'");
+}
+

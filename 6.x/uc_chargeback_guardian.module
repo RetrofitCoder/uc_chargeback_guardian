@@ -1,0 +1,321 @@
+<?php
+// $Id: $
+
+/**
+ * @file
+ * Process payments using Chargeback Guardian.
+ *
+ * Derived from uc_paytrace code by David Long <dave@longwaveconsulting.com>
+ * http://drupal.org/project/uc_paytrace
+ *
+ * For API reference see https://secure.chargebackguardiangateway.com/merchants/resources/processing.php?file=pdf
+ */
+
+/**
+ * Defines
+ */
+define('UC_CHARGEBACK_GUARDING_POST_URI', 'https://secure.chargebackguardiangateway.com/api/transact.php');
+define('UC_CHARGEBACK_GUARDIAN_TYPE_UC_CREDIT_AUTH_ONLY_VALUE', 'auth');
+define('UC_CHARGEBACK_GUARDIAN_TYPE_UC_CREDIT_AUTH_CAPTURE_VALUE', 'sale');
+define('UC_CHARGEBACK_GUARDIAN_TYPE_UC_CREDIT_PRIOR_AUTH_CAPTURE_VALUE', 'capture');
+define('UC_CHARGEBACK_GUARDIAN_PAYMENT_CC_VALUE', 'creditcard');
+define('UC_CHARGEBACK_GUARDIAN_RESPONSE_TXN_APPROVED', 1);
+define('UC_CHARGEBACK_GUARDIAN_RESPONSE_TXN_DECLINED', 2);
+define('UC_CHARGEBACK_GUARDIAN_RESPONSE_TXN_ERROR', 3);
+define('UC_CHARGEBACK_GUARDIAN_TEST_USERNAME', 'demo');
+define('UC_CHARGEBACK_GUARDIAN_TEST_PASSWORD', 'password');
+
+/**
+ * Implementation of hook_payment_gateway().
+ */
+function uc_chargeback_guardian_payment_gateway() {
+  $gateways[] = array(
+    'id' => 'chargeback_guardian',
+    'title' => t('Chargeback Guardian'),
+    'description' => t('Process credit card payments using Chargeback Guardian.'),
+    'settings' => 'uc_chargeback_guardian_settings_form',
+    'credit' => 'uc_chargeback_guardian_charge',
+// TODO: Follow up on what the additional functions would be.  E.g. credit, refund, etc.
+    'credit_txn_types' => array(UC_CREDIT_AUTH_ONLY, UC_CREDIT_PRIOR_AUTH_CAPTURE, UC_CREDIT_AUTH_CAPTURE),
+  );
+
+  return $gateways;
+}
+
+/**
+ * Payment gateway settings form.
+ */
+function uc_chargeback_guardian_settings_form() {
+  $form['uc_chargeback_guardian_api_test'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Use demo / test account.'),
+    '#description' => t('In test mode, the payment gateway demo account will be used.'),
+    '#default_value' => variable_get('uc_chargeback_guardian_api_test', FALSE),
+  );
+  $form['uc_chargeback_guardian_api_log_post_data'] = array(
+    '#type' => 'checkbox',
+    '#title' => t('Log POST data.'),
+    '#description' => t('Enable watchdog logging of the POST data when processing payments.<br /><strong>NOTE: card numbers and CVV values are sanitized.</strong>'),
+    '#default_value' => variable_get('uc_chargeback_guardian_api_log_post_data', FALSE),
+  );
+  $form['uc_chargeback_guardian_api_username'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Chargeback Guardian user name'),
+    '#default_value' => variable_get('uc_chargeback_guardian_api_username', ''),
+    '#required' => TRUE,
+  );
+  $form['uc_chargeback_guardian_api_password'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Chargeback Guardian password'),
+    '#default_value' => variable_get('uc_chargeback_guardian_api_password', ''),
+    '#required' => TRUE,
+  );
+
+  return $form;
+}
+
+/**
+ * Callback for processing a credit card transaction.
+ */
+function uc_chargeback_guardian_charge($order_id, $amount, $data) {
+  // Build POST data for the transaction.
+  $submit_data = _uc_chargeback_guardian_build_request($order_id, $amount, $data);
+  if ( FALSE === $submit_data ) {
+    return array('success' => FALSE);
+  }
+
+  // Send transaction request.
+  $response = _uc_chargeback_guardian_send_request($submit_data);
+  if ( FALSE === $response ) {
+    return array('success' => FALSE);
+  }
+
+  // Process the response and return the results array
+  return _uc_chargeback_guardian_proecess_response($order_id, $amount, $response);
+}
+
+/**
+ * Build the form post data to send to Chargeback Guardian.
+ */
+function _uc_chargeback_guardian_build_request($order_id, $amount, $data) {
+  // Determine the specific action to build the post data for
+  switch ( strtolower($data['txn_type']) ) {
+    case UC_CREDIT_AUTH_CAPTURE:
+    case UC_CREDIT_AUTH_ONLY:
+    case UC_CREDIT_CREDIT:
+      return _uc_chargeback_guardian_build_sale_auth_credit_request($order_id, $amount, $data);
+      break;
+    case UC_CREDIT_PRIOR_AUTH_CAPTURE:
+      return _uc_chargeback_guardian_build_capture_request();
+      break;
+    default:
+      return FALSE;
+  }
+}
+
+/**
+ * Build the form post data for sale, auth, and credit actions.
+ */
+function _uc_chargeback_guardian_build_sale_auth_credit_request($order_id, $amount, $data) {
+  // Sale or authorization request.
+  $order = uc_order_load($order_id);
+
+  $submit_data['amount'] = uc_currency_format($amount, FALSE, FALSE, '.');
+  $submit_data['type'] = (
+    $data['txn_type'] == UC_CREDIT_AUTH_ONLY ?
+      UC_CHARGEBACK_GUARDIAN_TYPE_UC_CREDIT_AUTH_ONLY_VALUE :
+      UC_CHARGEBACK_GUARDIAN_TYPE_UC_CREDIT_AUTH_CAPTURE_VALUE
+  );
+  $submit_data['ccnumber'] = $order->payment_details['cc_number'];
+  $submit_data['ccexp'] = substr('0'. $order->payment_details['cc_exp_month'], -2) . substr($order->payment_details['cc_exp_year'], -2);
+  $submit_data['payment'] = UC_CHARGEBACK_GUARDIAN_PAYMENT_CC_VALUE;
+
+  // Add card CSC/CVV value, if enabled.
+  if (variable_get('uc_credit_cvv_enabled', TRUE)) {
+    $submit_data['cvv'] = $order->payment_details['cc_cvv'];
+  }
+
+  $submit_data['email'] = substr($order->primary_email, 0, 50);
+  $submit_data['orderid'] = $order_id;
+  $submit_data['ipaddress'] = ip_address();
+
+  // Calculate tax.
+  $tax = 0;
+  if (module_exists('uc_taxes')) {
+    foreach (uc_taxes_calculate($order) as $tax_item) {
+      $tax += $tax_item->amount;
+    }
+  }
+  $submit_data['tax'] = uc_currency_format($tax, FALSE, FALSE, '.');
+
+  // Billing address fields
+  $submit_data['firstname'] = substr($order->billing_first_name, 0, 50);
+  $submit_data['firstname'] = substr($order->billing_last_name, 0, 50);
+  $submit_data['address1'] = substr($order->billing_street1, 0, 50);
+  $submit_data['address2'] = substr($order->billing_street2, 0, 50);
+  $submit_data['city'] = substr($order->billing_city, 0, 50);
+  $submit_data['state'] = substr(uc_get_zone_code($order->billing_zone), 0, 2);
+  $submit_data['zip'] = substr($order->billing_postal_code, 0, 9);
+
+  // Shipping address fields
+  $submit_data['shipping_firstname'] = substr($order->delivery_first_name, 0, 50);
+  $submit_data['shipping_lastname'] = substr($order->delivery_last_name, 0, 50);
+  $submit_data['shipping_address1'] = substr($order->delivery_street1, 0, 50);
+  $submit_data['shipping_address2'] = substr($order->delivery_street2, 0, 50);
+  $submit_data['shipping_city'] = substr($order->delivery_city, 0, 50);
+  $submit_data['shipping_state'] = substr(uc_get_zone_code($order->delivery_zone), 0, 2);
+  $submit_data['shipping_zip'] = substr($order->delivery_postal_code, 0, 9);
+  // shipping_country
+  // shipping_email
+  return $submit_data;
+}
+
+/**
+ * Build the form post data for sale, auth, and credit actions.
+ */
+function  _uc_chargeback_guardian_build_capture_request($order_id, $amount) {
+  // TODO: This block untested / incomplete.
+  // Capture previous authorization using transaction ID.
+  $submit_data['type'] = UC_CHARGEBACK_GUARDIAN_UC_CREDIT_PRIOR_AUTH_CAPTURE_VALUE;
+  $submit_data['transactionid'] = $data['txn_id'];
+  $submit_data['amount'] = uc_currency_format($amount, FALSE, FALSE, '.');
+  // tracking_number Optional Shipping Tracking Number
+  // shipping_carrier Optional {ups,fedex,dhl,usps} Shipping Carrier
+  $submit_data['orderid'] = $order_id;
+
+  return $submit_data;
+}
+
+/**
+ * Send a request to the Chargeback Guardian API and parse the response.
+ */
+function _uc_chargeback_guardian_send_request($data) {
+  // Set test mode, if required.
+  if (variable_get('uc_chargeback_guardian_api_test', FALSE)) {
+    $username = UC_CHARGEBACK_GUARDIAN_TEST_USERNAME;
+    $password = UC_CHARGEBACK_GUARDIAN_TEST_PASSWORD;
+  }
+  else {
+    $username = variable_get('uc_chargeback_guardian_api_username', '');
+    $password = variable_get('uc_chargeback_guardian_api_password', '');
+  }
+
+  // Add common fields to the request.
+  $data = array(
+    'username' => $username,
+    'password' => $password,
+  ) + $data;
+
+  // Format data for the request.
+  $post_data = array();
+  $clean_post_data = array();
+  foreach ($data as $key => $value) {
+    $post_data[] = $key .'='. urlencode($value);
+    if ( 'ccnumber' == $key ) {
+      $clean_post_data[] = $key .  '=' . '************' . substr($value, -4);
+    }
+    elseif ( 'cvv' == $key ) {
+      $clean_post_data[] = $key .  '=' . substr($value['cvv'], -1);
+    }
+    else {
+      $clean_post_data[] = $key .'='. urlencode($value);
+    }
+  }
+
+  // Send the cURL request and retrieve the response.
+  $curl_options = array(
+    CURLOPT_URL => UC_CHARGEBACK_GUARDING_POST_URI,
+    CURLOPT_VERBOSE => FALSE,
+    CURLOPT_POST => TRUE,
+    CURLOPT_POSTFIELDS => implode('&', $post_data),
+    CURLOPT_RETURNTRANSFER => TRUE,
+    CURLOPT_SSL_VERIFYPEER => FALSE,
+    CURLOPT_NOPROGRESS => TRUE,
+    CURLOPT_FOLLOWLOCATION => FALSE,
+  );
+  $ch = curl_init();
+  curl_setopt_array($ch, $curl_options);
+  $response_string = curl_exec($ch);
+  $error = curl_error($ch);
+  curl_close($ch);
+
+  // Log any errors to the watchdog.
+  if ($error) {
+    watchdog('uc_chargeback_guardian', 'cURL error: @error', array('@error' => $error), WATCHDOG_ERROR);
+    return FALSE;
+  }
+  // Log any debugging information when configured.
+  if (variable_get('uc_chargeback_guardian_api_log_post_data', FALSE)) {
+    // Sanitize CC Number and CVV
+    $watchdog_vars = array(
+      '@post' => implode('&', $clean_post_data),
+      '@info' => print_r(curl_getinfo($ch), TRUE),
+      '@response' => $response_string,
+    );
+    watchdog('uc_chargeback_guardian', "cURL Call made for Chargeback Guardian using test mode.\nPOST data: @post<br />\ncURL Transfer Info: @info<br />\ncURL Response: @response", $watchdog_vars, WATCHDOG_DEBUG);
+  }
+
+  // Parse the response string.
+  $response = array();
+  foreach (explode('&', $response_string) as $pair) {
+    list($key, $value) = explode('=', $pair);
+    $response[$key] = $value;
+  }
+
+  return $response;
+}
+
+function _uc_chargeback_guardian_proecess_response($order_id, $amount, $response) {
+  global $user;
+
+  // Check for errors.
+  $success = FALSE;
+  if ( $response['response'] == UC_CHARGEBACK_GUARDIAN_RESPONSE_TXN_ERROR ) {
+    $message = t('Chargeback Guardian error: @error', array('@error' => $response['responsetext']));
+  }
+  elseif ( $response['response'] == UC_CHARGEBACK_GUARDIAN_RESPONSE_TXN_DECLINED ) {
+    // Check if this this was a capture
+    if ($data['txn_type'] == UC_CREDIT_PRIOR_AUTH_CAPTURE) {
+      // For a capture, format a different message
+      $message = t('Capture failed: @error', array('@error' => $response['responsetext']));
+    }
+    else {
+      $message = t('Credit card payment declined: @error', array('@error' => $response['responsetext']));
+    }
+  }
+  else {
+    // Sale, capture, or authorization succeeded.
+    $message = t('Message: @message<br />Transaction ID: @id<br />Authorization Code: @auth', array('@message' => $response['responsetext'], '@id' => $response['transactionid'], '@auth' => $response['authcode']));
+    $success = TRUE;
+
+    // Log authorization data.
+    if ($data['txn_type'] == UC_CREDIT_AUTH_ONLY) {
+      uc_credit_log_authorization($order_id, $response['transactionid'], $amount);
+    }
+    elseif ($data['txn_type'] == UC_CREDIT_PRIOR_AUTH_CAPTURE) {
+      $message = t('Capture successful.<br />Transaction ID: @id<br />Authorization Code: @auth', array('@id' => $response['transactionid'], '@auth' => $response['authcode']));
+      uc_credit_log_prior_auth_capture($order_id, $response['authcode']);
+    }
+  }
+
+  // Build result array.
+  $result = array(
+    'success' => $success,
+    'comment' => $message,
+    'message' => $message,
+    'uid' => $user->uid,
+    'log_payment' => ($data['txn_type'] != UC_CREDIT_AUTH_ONLY),
+  );
+  if ($response['authcode']) {
+    $result['data'] = array('module' => 'uc_chargeback_guardian', 'txn_id' => $response['transactionid']);
+  }
+
+  // Build an admin order comment.
+  $comment = $message .'<br />'. t('AVS response: @avs', array('@avs' => $response['avsresponse']));
+  if (variable_get('uc_credit_cvv_enabled', TRUE)) {
+    $comment .= '<br />'. t('CVV response: @cvv', array('@cvv' => $response['cvvresponse']));
+  }
+  uc_order_comment_save($order_id, $user->uid, $comment, 'admin');
+
+  return $result;
+}

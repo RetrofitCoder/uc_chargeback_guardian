@@ -1,0 +1,7 @@
+; $Id: $ 
+name = Chargeback Guardian
+description = Process payments using the Chargeback Guardian API.
+dependencies[] = uc_credit
+package = Ubercart - payment
+core = 6.x
+
