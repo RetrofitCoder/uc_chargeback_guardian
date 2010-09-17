@@ -35,7 +35,7 @@ function uc_chargeback_guardian_payment_gateway() {
     'description' => t('Process credit card payments using Chargeback Guardian.'),
     'settings' => 'uc_chargeback_guardian_settings_form',
     'credit' => 'uc_chargeback_guardian_charge',
-// TODO: Follow up on what the additional functions would be.  E.g. credit, refund, etc.
+    // TODO: Follow up on what the additional functions would be.  E.g. credit, refund, etc.
     'credit_txn_types' => array(UC_CREDIT_AUTH_ONLY, UC_CREDIT_PRIOR_AUTH_CAPTURE, UC_CREDIT_AUTH_CAPTURE),
   );
 
@@ -187,7 +187,7 @@ function  _uc_chargeback_guardian_build_capture_request($order_id, $amount) {
 }
 
 /**
- * Send a request to the Chargeback Guardian API and parse the response.
+ * Send a request to the Chargeback Guardian API.
  */
 function _uc_chargeback_guardian_send_request($data) {
   // Set test mode, if required.
@@ -206,19 +206,22 @@ function _uc_chargeback_guardian_send_request($data) {
     'password' => $password,
   ) + $data;
 
-  // Format data for the request.
+  // Format data for the request and later possible logging.
   $post_data = array();
   $clean_post_data = array();
   foreach ($data as $key => $value) {
     $post_data[] = $key .'='. urlencode($value);
-    if ( 'ccnumber' == $key ) {
-      $clean_post_data[] = $key .  '=' . '************' . substr($value, -4);
-    }
-    elseif ( 'cvv' == $key ) {
-      $clean_post_data[] = $key .  '=' . substr($value['cvv'], -1);
-    }
-    else {
-      $clean_post_data[] = $key .'='. urlencode($value);
+    // Sanitize the ccnumber / cvv from any information passed to watchdog later.
+    switch ( $key ) {
+      case 'ccnumber':
+        $clean_post_data[] = $key .  '=' . '************' . substr($value, -4);
+        break;
+      case 'cvv':
+        $clean_post_data[] = $key .  '=' . substr($value['cvv'], -1);
+        break;
+      default:
+        $clean_post_data[] = $key .'='. urlencode($value);
+        break;
     }
   }
 
@@ -246,7 +249,7 @@ function _uc_chargeback_guardian_send_request($data) {
   }
   // Log any debugging information when configured.
   if (variable_get('uc_chargeback_guardian_api_log_post_data', FALSE)) {
-    // Sanitize CC Number and CVV
+    // Use information with sanitized CC Number and CVV
     $watchdog_vars = array(
       '@post' => implode('&', $clean_post_data),
       '@info' => print_r(curl_getinfo($ch), TRUE),
@@ -265,6 +268,9 @@ function _uc_chargeback_guardian_send_request($data) {
   return $response;
 }
 
+/**
+ * Parse the response from Chargeback Guardian.
+ */
 function _uc_chargeback_guardian_proecess_response($order_id, $amount, $response) {
   global $user;
 
@@ -319,3 +325,4 @@ function _uc_chargeback_guardian_proecess_response($order_id, $amount, $response
 
   return $result;
 }
+
